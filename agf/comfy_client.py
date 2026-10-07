@@ -57,9 +57,23 @@ class ComfyClient:
     @staticmethod
     def load_graph(path: str | os.PathLike) -> dict:
         try:
-            return json.loads(Path(path).read_text())
+            raw = json.loads(Path(path).read_text())
         except (OSError, json.JSONDecodeError) as exc:
             raise ComfyError(f"cannot read workflow {path}: {exc}") from exc
+        # Detect UI-format exports (they have "nodes"/"links", not API-format ids).
+        if isinstance(raw, dict) and ("nodes" in raw or "links" in raw):
+            raise ComfyError(
+                f"workflow {path} looks like ComfyUI UI-format (has 'nodes'/'links'). "
+                "In ComfyUI click 'Save (API Format)' and save that JSON instead."
+            )
+        if not isinstance(raw, dict) or not raw:
+            raise ComfyError(f"workflow {path} is empty or invalid (expected API-format dict)")
+        if not any(isinstance(n, dict) and "class_type" in n for n in raw.values()):
+            raise ComfyError(
+                f"workflow {path} has no 'class_type' nodes — "
+                "it is not an API-format export. Use 'Save (API Format)'."
+            )
+        return raw
 
     @staticmethod
     def _positive_node_ids(graph: dict) -> list[str]:
@@ -122,6 +136,7 @@ class ComfyClient:
         prepared = copy.deepcopy(graph)
         target_ids = set(ComfyClient._positive_node_ids(prepared)) if positive is not None else set()
         neg_ids = set(ComfyClient._negative_node_ids(prepared)) if negative is not None else set()
+        seed_counter = 0
         for node_id, node in prepared.items():
             if not isinstance(node, dict) or "inputs" not in node:
                 continue
@@ -132,10 +147,32 @@ class ComfyClient:
             if negative is not None and node_id in neg_ids:
                 inputs["text"] = negative
             if seed is not None and "seed" in inputs:
-                inputs["seed"] = int(seed)
+                # Distinct seed per sampler node: same run, uncorrelated noise.
+                inputs["seed"] = int(seed) + seed_counter
+                seed_counter += 1
             if checkpoint is not None and class_type == "CheckpointLoaderSimple":
                 inputs["ckpt_name"] = checkpoint
         return prepared
+
+    @staticmethod
+    def validate_workflow(path: str | os.PathLike) -> list[str]:
+        """Return a list of problems (empty = OK). Never raises."""
+        try:
+            graph = ComfyClient.load_graph(path)
+        except Exception as exc:
+            return [str(exc)]
+        problems: list[str] = []
+        if not ComfyClient._positive_node_ids(graph):
+            problems.append("no CLIPTextEncode positive node found")
+        if not ComfyClient._negative_node_ids(graph):
+            problems.append("no negative prompt node found (continuing with positive only)")
+        has_sampler = any(
+            isinstance(n, dict) and "seed" in (n.get("inputs") or {})
+            for n in graph.values()
+        )
+        if not has_sampler:
+            problems.append("no sampler/seed node found — seeds will not be randomized")
+        return problems
 
     async def queue(self, graph: dict, client_id: str | None = None) -> str:
         payload = {"prompt": graph, "client_id": client_id or str(uuid.uuid4())}
@@ -147,6 +184,7 @@ class ComfyClient:
     async def wait(self, prompt_id: str, timeout: float = 600.0) -> list[MediaRef]:
         deadline = time.monotonic() + timeout
         errors = 0
+        polls = 0
         while True:
             try:
                 response = await self._http.get(f"/history/{prompt_id}")
@@ -192,7 +230,9 @@ class ComfyClient:
                             return refs
             if time.monotonic() > deadline:
                 raise TimeoutError(f"comfyui did not finish prompt {prompt_id} in {timeout}s")
-            await asyncio.sleep(1.0)
+            # Back off while queued: 1s -> 5s max so we don't hammer ComfyUI.
+            polls += 1
+            await asyncio.sleep(min(1.0 + polls * 0.5, 5.0))
 
     async def fetch(self, ref: MediaRef) -> bytes:
         params = {"filename": ref.filename, "type": ref.type}
@@ -219,9 +259,12 @@ class ComfyClient:
     ) -> bytes:
         medias = await self.generate_all(
             graph, positive=positive, negative=negative, seed=seed,
-            checkpoint=checkpoint, timeout=timeout, limit=1,
+            checkpoint=checkpoint, timeout=timeout, limit=4,
         )
-        return medias[0]
+        # Workflows often emit a preview + final image. Prefer the largest
+        # payload (usually the final), falling back to the last output.
+        best = max(range(len(medias)), key=lambda i: (len(medias[i]), i))
+        return medias[best]
 
     async def generate_all(
         self,

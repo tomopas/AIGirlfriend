@@ -32,16 +32,30 @@ async def proactive_loop(
     send_text: SendText,
     send_photo: SendPhoto,
     cfg: Config,
+    initial_delay_range: tuple[float, float] = (60.0, 180.0),
 ) -> None:
     log.info("proactive loop started (%s-%s h, pic prob %s)", cfg.proactive_min_hours, cfg.proactive_max_hours, cfg.proactive_image_prob)
+    first = True
+    short_wait = False
     while True:
-        delay = random.uniform(cfg.proactive_min_hours, cfg.proactive_max_hours) * 3600.0
+        if first:
+            # Say hi soon after startup instead of going silent for 2-6h.
+            delay = random.uniform(*initial_delay_range)
+            first = False
+        elif short_wait:
+            # After a skipped tick (quiet hours / user active), re-check soon
+            # instead of sleeping another full 2-6h window.
+            delay = random.uniform(10 * 60.0, 20 * 60.0)
+            short_wait = False
+        else:
+            delay = random.uniform(cfg.proactive_min_hours, cfg.proactive_max_hours) * 3600.0
         await asyncio.sleep(delay)
         try:
             # quiet hours: stay silent overnight by default if configured
             hour = datetime.now().hour
             if in_quiet_hours(hour, cfg.proactive_quiet_start, cfg.proactive_quiet_end):
                 log.debug("proactive tick skipped (quiet hours)")
+                short_wait = True
                 continue
             # recency: don't ping if user was recently active
             try:
@@ -52,6 +66,7 @@ async def proactive_loop(
                 idle_min = (time.time() - last_ts) / 60.0
                 if idle_min < cfg.proactive_min_idle_minutes:
                     log.debug("proactive tick skipped (active %.1f min ago)", idle_min)
+                    short_wait = True
                     continue
             roll = random.random()
             if roll < cfg.proactive_image_prob and cfg.image_workflow:

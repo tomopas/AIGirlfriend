@@ -38,6 +38,20 @@ CREATE TABLE IF NOT EXISTS chat_history (
     text TEXT NOT NULL,
     ts INTEGER NOT NULL
 );
+-- Full-text index for scalable keyword recall (kept in sync via triggers).
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+    text, content='memories', content_rowid='id', tokenize='porter'
+);
+CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+    INSERT INTO memories_fts(rowid, text) VALUES (new.id, new.text);
+END;
+CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, text) VALUES('delete', old.id, old.text);
+END;
+CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, text) VALUES('delete', old.id, old.text);
+    INSERT INTO memories_fts(rowid, text) VALUES (new.id, new.text);
+END;
 """
 
 
@@ -72,9 +86,18 @@ class MemoryStore:
     def _worker(self) -> None:
         conn = sqlite3.connect(str(self.path))
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
         conn.execute("PRAGMA foreign_keys = ON")
         conn.executescript(_SCHEMA)
         conn.commit()
+        # Rebuild FTS for pre-existing DBs created before the FTS table existed,
+        # or after out-of-band writes. Cheap for small DBs; keeps recall correct.
+        try:
+            conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+            conn.commit()
+        except sqlite3.Error:
+            pass
         while not self._closing.is_set() or not self._queue.empty():
             try:
                 func, future, loop = self._queue.get(timeout=0.5)
@@ -155,17 +178,60 @@ class MemoryStore:
     @staticmethod
     def _all_memories(conn: sqlite3.Connection, limit: int = 500) -> list[dict]:
         cursor = conn.execute(
-            "SELECT m.id, m.text, m.kind, m.importance, me.vector "
+            "SELECT m.id, m.text, m.kind, m.importance, m.created_at, me.vector "
             "FROM memories m LEFT JOIN memory_embeddings me ON me.memory_id = m.id "
             "ORDER BY m.id DESC LIMIT ?",
             (limit,),
         )
         return [dict(row) for row in cursor.fetchall()]
 
+    @staticmethod
+    def _fts_ids(conn: sqlite3.Connection, query: str, limit: int = 100) -> list[int]:
+        # Sanitize FTS5 query: keep alphanumeric tokens, OR them together.
+        tokens = re.findall(r"[a-z0-9]+", query.lower())[:12]
+        if not tokens:
+            return []
+        match = " OR ".join(tokens)
+        try:
+            cursor = conn.execute(
+                "SELECT rowid AS id FROM memories_fts WHERE memories_fts MATCH ? LIMIT ?",
+                (match, limit),
+            )
+            return [int(r["id"]) for r in cursor.fetchall()]
+        except sqlite3.Error:
+            return []
+
+    @staticmethod
+    def _recency_boost(created_at: object, now: int) -> float:
+        try:
+            age_hours = max(0.0, (now - int(created_at or now)) / 3600.0)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 1.0
+        # Half-life ~30 days: fresh memories rank slightly higher, old ones never vanish.
+        decay = 1.0 / (1.0 + age_hours / 720.0)
+        return 0.7 + 0.3 * decay
+
     async def recall(self, query: str, k: int = 5, min_score: float = 0.15) -> list[dict]:
-        rows = await self._submit(lambda conn: self._all_memories(conn))
+        def _candidates(conn: sqlite3.Connection) -> list[dict]:
+            recent = self._all_memories(conn, limit=200)
+            fts_ids = self._fts_ids(conn, query, limit=100)
+            if not fts_ids:
+                return recent
+            seen = {r["id"] for r in recent}
+            placeholders = ",".join("?" for _ in fts_ids)
+            cursor = conn.execute(
+                f"SELECT m.id, m.text, m.kind, m.importance, m.created_at, me.vector "
+                f"FROM memories m LEFT JOIN memory_embeddings me ON me.memory_id = m.id "
+                f"WHERE m.id IN ({placeholders})",
+                fts_ids,
+            )
+            extra = [dict(r) for r in cursor.fetchall() if r["id"] not in seen]
+            return recent + extra
+
+        rows = await self._submit(_candidates)
         if not rows:
             return []
+        now = _now()
         query_vector = await self._embed_text(query)
         scored: list[tuple[float, dict]] = []
         if query_vector is not None:
@@ -182,7 +248,8 @@ class MemoryStore:
                 sim = _cosine(query_vector, vector)
                 if sim < min_score:
                     continue
-                scored.append((sim * (0.5 + row["importance"]), row))
+                boost = self._recency_boost(row.get("created_at"), now)
+                scored.append((sim * (0.5 + row["importance"]) * boost, row))
             if not scored:
                 # fall through to keyword search if all vectors stale/missing
                 query_vector = None
@@ -192,7 +259,8 @@ class MemoryStore:
                 words = set(re.findall(r"[a-z0-9]+", row["text"].lower()))
                 overlap = len(query_words & words)
                 if overlap:
-                    scored.append((float(overlap) * (0.5 + row["importance"]), row))
+                    boost = self._recency_boost(row.get("created_at"), now)
+                    scored.append((float(overlap) * (0.5 + row["importance"]) * boost, row))
         scored.sort(key=lambda item: item[0], reverse=True)
         top = scored[:k]
         return [
@@ -206,13 +274,21 @@ class MemoryStore:
             for score, row in top
         ]
 
-    async def list_memories(self, limit: int = 100) -> list[dict]:
+    async def list_memories(self, limit: int = 100, offset: int = 0) -> list[dict]:
         def _run(conn: sqlite3.Connection) -> list[dict]:
             cursor = conn.execute(
-                "SELECT id, text, kind, importance, created_at FROM memories ORDER BY id DESC LIMIT ?",
-                (limit,),
+                "SELECT id, text, kind, importance, created_at FROM memories ORDER BY id DESC LIMIT ? OFFSET ?",
+                (limit, offset),
             )
             return [dict(row) for row in cursor.fetchall()]
+
+        return await self._submit(_run)
+
+    async def count_memories(self) -> int:
+        def _run(conn: sqlite3.Connection) -> int:
+            cursor = conn.execute("SELECT COUNT(*) AS n FROM memories")
+            row = cursor.fetchone()
+            return int(row["n"]) if row else 0
 
         return await self._submit(_run)
 
@@ -284,6 +360,38 @@ class MemoryStore:
             return {row["key"]: row["value"] for row in cursor.fetchall()}
 
         return await self._submit(_run)
+
+    async def delete_profile_key(self, key: str) -> bool:
+        def _run(conn: sqlite3.Connection) -> bool:
+            cursor = conn.execute("DELETE FROM profile WHERE key = ?", (key,))
+            conn.commit()
+            return cursor.rowcount > 0
+
+        return await self._submit(_run)
+
+    async def clear_profile(self) -> int:
+        def _run(conn: sqlite3.Connection) -> int:
+            cursor = conn.execute("DELETE FROM profile")
+            conn.commit()
+            return int(cursor.rowcount)
+
+        return await self._submit(_run)
+
+    async def backup_to(self, dest: str | os.PathLike) -> Path:
+        """Online backup of the SQLite DB (safe to call while running)."""
+        dest_path = Path(dest)
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+        def _run(conn: sqlite3.Connection) -> int:
+            target = sqlite3.connect(str(dest_path))
+            try:
+                conn.backup(target)
+            finally:
+                target.close()
+            return 1
+
+        await self._submit(_run)
+        return dest_path
 
     async def add_chat(self, role: str, text: str, max_history: int = 500) -> None:
         def _run(conn: sqlite3.Connection) -> None:

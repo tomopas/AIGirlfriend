@@ -60,11 +60,15 @@ class OllamaClient:
                         obj = json.loads(line)
                     except json.JSONDecodeError:
                         continue
+                    if obj.get("error"):
+                        raise OllamaError(f"ollama chat error: {obj['error']}")
                     if obj.get("done"):
                         break
                     chunk = (obj.get("message") or {}).get("content", "")
                     if chunk:
                         yield chunk
+        except OllamaError:
+            raise
         except httpx.HTTPError as exc:
             raise OllamaError(f"ollama chat request failed: {exc}") from exc
 

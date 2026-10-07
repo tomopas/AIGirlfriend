@@ -78,9 +78,12 @@ python main.py              # run the bot (ctrl+c to stop)
 | `/photo <prompt>`    | generate and send an image now |
 | `/video <prompt>`    | generate via your video workflow (if configured) |
 | `/remember <text>`   | store a fact manually |
-| `/memories`          | list stored memories |
-| `/forget`            | wipe memory store |
+| `/memories [page]`   | list stored memories (10 per page) |
+| `/forget <id>\|profile\|all` | wipe one memory, tastes, or everything |
+| `/clear`             | clear chat history |
+| `/model`             | llm info |
 | `/status`            | health of Ollama + ComfyUI |
+| `/help`              | what she can do |
 
 ## How it works
 
@@ -112,8 +115,8 @@ agf/
   services.py           reply / photo / intent / memory-extraction pipeline
   telegram_bot.py       telegram handlers
   proactive.py          scheduling loop
-  workflows/            your API-format ComfyUI JSONs go here
-  tests/                unit tests (config, memory, comfy, intent)
+workflows/              your API-format ComfyUI JSONs go here
+tests/                  unit tests (config, memory, comfy, intent)
 ```
 
 ## Testing

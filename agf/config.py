@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Optional
 
 import yaml
+
+log = logging.getLogger(__name__)
 
 
 def load_dotenv(path: str | os.PathLike) -> None:
@@ -147,4 +150,59 @@ class Config:
         # sanity: swap if min > max
         if cfg.proactive_min_hours > cfg.proactive_max_hours:
             cfg.proactive_min_hours, cfg.proactive_max_hours = cfg.proactive_max_hours, cfg.proactive_min_hours
+        # warn on unknown yaml keys (typos are otherwise silent)
+        known = {f.name for f in fields(cls)}
+        for key in raw:
+            if key not in known:
+                log.warning("unknown config key %r in %s — ignored", key, config_path)
+        cfg.normalize()
         return cfg
+
+    def normalize(self) -> list[str]:
+        """Clamp/validate ranges in place. Returns list of warnings."""
+        warnings: list[str] = []
+        if not 0.0 <= self.temperature <= 2.0:
+            warnings.append(f"temperature {self.temperature} out of range [0, 2]; clamped")
+            self.temperature = min(max(self.temperature, 0.0), 2.0)
+        if not 0.0 <= self.proactive_image_prob <= 1.0:
+            warnings.append(
+                f"proactive_image_prob {self.proactive_image_prob} out of range [0, 1]; clamped"
+            )
+            self.proactive_image_prob = min(max(self.proactive_image_prob, 0.0), 1.0)
+        if self.proactive_min_hours < 0 or self.proactive_max_hours < 0:
+            warnings.append("proactive hours must be >= 0; clamped")
+            self.proactive_min_hours = max(0.0, self.proactive_min_hours)
+            self.proactive_max_hours = max(0.0, self.proactive_max_hours)
+        if self.proactive_min_hours > self.proactive_max_hours:
+            self.proactive_min_hours, self.proactive_max_hours = (
+                self.proactive_max_hours,
+                self.proactive_min_hours,
+            )
+        for attr in ("proactive_quiet_start", "proactive_quiet_end"):
+            value = getattr(self, attr)
+            if value is not None and not 0 <= value <= 23:
+                warnings.append(f"{attr} {value} out of range [0, 23]; disabled")
+                setattr(self, attr, None)
+        if not self.data_dir:
+            warnings.append("data_dir empty; using 'data'")
+            self.data_dir = "data"
+        if not self.persona_path:
+            warnings.append("persona_path empty; using 'persona.yaml'")
+            self.persona_path = "persona.yaml"
+        for warning in warnings:
+            log.warning("%s", warning)
+        return warnings
+
+    def validate(self) -> list[str]:
+        """Non-mutating checks for startup. Returns list of error strings."""
+        errors: list[str] = []
+        if not self.telegram_token:
+            errors.append("TELEGRAM_BOT_TOKEN not set")
+        if not self.allowed_chat_ids and not self.allows_everyone:
+            errors.append("ALLOWED_CHAT_ID not set — bot will refuse everyone")
+        for label, path in (("image_workflow", self.image_workflow), ("video_workflow", self.video_workflow)):
+            if path and not Path(path).exists():
+                errors.append(f"{label} {path!r} not found")
+        if not Path(self.persona_path).exists():
+            errors.append(f"persona {self.persona_path!r} not found (fallback persona will be used)")
+        return errors
