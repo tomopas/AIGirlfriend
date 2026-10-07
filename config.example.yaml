@@ -1,0 +1,16 @@
+ollama_url: http://localhost:11434
+comfyui_url: http://localhost:8188
+llm_model: dolphin-llama3
+embed_model: nomic-embed-text
+image_workflow: workflows/image_workflow.json
+video_workflow: ""
+nsfw: true
+temperature: 0.85
+proactive_min_hours: 2
+proactive_max_hours: 6
+proactive_image_prob: 0.3
+proactive_min_idle_minutes: 30
+proactive_quiet_start: 0
+proactive_quiet_end: 7
+data_dir: data
+persona_path: persona.yaml

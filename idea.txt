@@ -1,0 +1,3 @@
+- This should be an AI Girlfriend using Ollama for the LLM and comfyui for video and image generation and telegram for user interactions.
+- It should have a memory and remember important things about you. It should also be uncensored and remember sexual preferences and kinks.
+- It should text the user from time to time Ãlike a girlfriend would do and also send explicit pictures from time to time.

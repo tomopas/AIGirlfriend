@@ -1,0 +1,95 @@
+# ── Secrets / local config — never commit ──
+.env*
+!.env.example
+config.yaml
+config.local.yaml
+persona.local.yaml
+
+# ── Project-specific: runtime data & generated media ──
+# local sqlite memory (data/memory.db + wal/shm journals)
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+*.wal
+*.shm
+# comfyui outputs / bot downloads
+out/
+media/
+downloads/
+
+# ComfyUI graphs: keep examples, ignore your local ones
+workflows/*
+!workflows/*.example
+!workflows/.gitkeep
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ── Virtual envs ──
+.venv/
+venv/
+ENV/
+env/
+.conda/
+
+# ── Testing / coverage / lint caches ──
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+
+# ── Logs / temp ──
+*.log
+logs/
+*.tmp
+*.bak
+*.swp
+*~
+
+# ── OS ──
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ── IDEs / editors ──
+.vscode/
+.idea/
+*.code-workspace
+*.sublime-project
+*.sublime-workspace
+.lh/
+.spyderproject
+.ropeproject
