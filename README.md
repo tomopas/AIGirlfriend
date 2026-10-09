@@ -63,6 +63,64 @@ Run `python main.py --check` to confirm everything is reachable before chatting.
 | LLM       | `dolphin-llama3`, `dolphin-mistral`, or an abliterated qwen/mistral GGUF you import | uncensored roleplay-friendly |
 | embeddings | `nomic-embed-text`, `snowflake-arctic-embed`               | used for memory recall |
 
+### Uncensoring an LLM with Heretic
+
+If no ready-made uncensored model fits (or a new base model just dropped), you can
+remove the refusal behaviour yourself with [Heretic](https://github.com/p-e-w/heretic)
+(`pip install -U heretic-llm`). It performs *directional ablation* ("abliteration"):
+it finds the model's internal "refusal direction" and orthogonalises it out of the
+weights, while an Optuna-based search co-minimises refusal rate **and** KL divergence
+from the original model — so the decensored model keeps its intelligence. No
+fine-tuning, no transformer knowledge needed:
+
+```bash
+pip install -U heretic-llm
+heretic Qwen/Qwen3-4B             # replace with any supported HF model id
+```
+
+Expect roughly 45 minutes for an 8B model on an RTX 3090. Heretic supports most dense
+models, several MoE architectures, and some hybrids (Qwen3.5); pure state-space models
+are not supported. Note the pipeline order: Heretic edits raw HuggingFace weights
+(PyTorch/transformers) — Ollama can't run it directly. Convert the result to GGUF
+(`llama.cpp`), then import it into Ollama with a `Modelfile` (`ollama create mymodel
+-F Modelfile`) and set it as `LLM_MODEL` in `.env`.
+
+Fast path if you have no GPU time: pull a community pre-abliterated model instead —
+`huihui-ai/<model>-abliterated` variants or `*-heretic` GGUFs on the Ollama registry
+are built exactly this way.
+
+### NSFW image models (why stock Krea2-turbo says no)
+
+NSFW success is decided by the **diffusion checkpoint**, not by prompt wording. Krea 2
+ships open weights in two variants — RAW (52-step base) and Turbo (8-step distilled) —
+but the stock `krea2_turbo_fp8_scaled` checkpoint is restriction-tuned: even explicit
+prompts ("nude", "feet") come back as normal clothed selfies. Two things compound this:
+
+1. The reference Krea workflow bakes a prompt-enhancer into the graph whose system
+   prompt says *"assume clothing covers genitals"*. This bot neutralises that
+   automatically (`ComfyClient.prepare(..., force=True)` replaces the linked prompt
+   and prunes the enhancer chain before queueing), so you don't need to edit the
+   workflow — but be aware of it if you test prompts by hand in ComfyUI.
+2. A square *portrait* crop physically cannot show feet. The bot's prompt builder
+   (`agf/persona.py`) therefore switches body-part subjects (feet, nude, lingerie)
+   to full-body framing automatically — check the bot log (`image prompt (...)` line)
+   to see the exact prompt that was queued.
+
+If stock Turbo still refuses, swap the checkpoint — drop the file into
+`ComfyUI/models/diffusion_models` (UNET-style, like Krea/Flux) or
+`ComfyUI/models/checkpoints` (classic, like SDXL/Pony), point the loader node at it
+in ComfyUI, **Save (API Format)**, and update `image_workflow` in `config.yaml`:
+
+| checkpoint | type | notes |
+|------------|------|-------|
+| Uncensored Krea2 finetune (e.g. `Kreamania` on Civitai) | drop-in Turbo replacement | refined from Krea2 with the restrictions removed; keeps the same realism |
+| `Pony Diffusion V6 XL` (+ NSFW merges) | classic checkpoint | the most-downloaded NSFW-capable family; needs an SDXL-style workflow, not the Krea graph |
+| `IllustriousXL` (+ NSFW merges) | classic checkpoint | photorealistic SDXL fork with strong NSFW community support |
+
+Residual refusals after a swap almost always come from the *text encoder*
+(Qwen3VL on the Krea graph) rather than the checkpoint — rephrase rather than
+pushing harder on the same words.
+
 ## Run
 
 ```bash

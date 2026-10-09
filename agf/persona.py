@@ -105,6 +105,51 @@ _NSFW_BLOCK_WORDS = (
 
 _SUBJECT_MAX_LEN = 300
 
+# keyword groups -> extra diffusion tokens, appended ONLY when nsfw=True so an
+# explicit ask ("nude", "feet", "topless", "lingerie" ...) reaches the image
+# model as strong tokens instead of being drowned out by "seductive".
+# Framing matters as much as the words: a "portrait photo" crop can never show
+# feet, so body-part subjects carry full-body framing (and flip the base shot
+# from portrait to full-body below). Kept to soft-NSFW vocabulary; stock aligned
+# checkpoints (Krea2-turbo, Flux) may still refuse explicit renders — see README.
+_NSFW_SUBJECT_TAGS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("feet", "foot", "soles", "toes", "barefoot"), "full-body photo, head to feet in frame, legs stretched toward camera, bare feet, detailed toes, soles visible, foot focus"),
+    (("nude", "naked", "undressed", "without clothes", "n@ked"), "full-body photo, head to feet in frame, nude, artistic nude photography, bare skin, uncovered breasts"),
+    (("topless", "without top", "no top"), "upper body shot, topless, bare breasts, uncovered"),
+    (("lingerie", "underwear", "bra", "panties", "thong", "negligee", "babydoll", "bikini"), "full-body photo, lingerie, lace bra and panties, skimpy outfit"),
+    (("shower", "bath", "bathtub"), "in shower, wet skin, water droplets"),
+    (("bed", "bedroom", "sheets"), "in bed, rumpled sheets, intimate bedroom"),
+    (("sexy", "seductive", "tease", "horny", "aroused", "nsfw", "explicit"), "sexy, seductive pose, bedroom eyes, alluring"),
+)
+
+# Subjects containing these fight the default "hoodie and shorts" appearance
+# text — drop that clothing sentence so clothed-vs-nude tokens don't cancel out.
+_CLOTHING_CONFLICT_WORDS = (
+    "nude", "naked", "undressed", "without clothes", "topless",
+    "lingerie", "underwear", "bra", "panties", "thong", "negligee", "bikini",
+)
+
+# Leading chat filler stripped from subjects ("send me a pic of you nude" -> "nude").
+_SUBJECT_PREFIXES = (
+    "send me", "give me", "gimme", "show me", "please send", "me", "myself",
+    "a photo of your", "a pic of your", "a picture of your", "a selfie of your",
+    "photo of your", "pic of your", "picture of your", "selfie of your",
+    "a photo of you", "a pic of you", "a picture of you", "a selfie of you",
+    "photo of you", "pic of you", "picture of you", "selfie of you",
+    "a photo of urself", "a pic of urself", "photo of urself", "pic of urself",
+    "of your", "of you", "of urself",
+    "a photo", "a pic", "a picture", "a selfie",
+    "photo", "pic", "picture", "selfie", "please", "a", "an",
+)
+
+
+def _nsfw_extra_tags(subject_lower: str) -> list[str]:
+    extras: list[str] = []
+    for keywords, tags in _NSFW_SUBJECT_TAGS:
+        if any(k in subject_lower for k in keywords):
+            extras.append(tags)
+    return extras
+
 
 def _sanitize_subject(subject: str, nsfw_enabled: bool) -> str:
     s = re.sub(r"\s+", " ", (subject or "").strip())[:_SUBJECT_MAX_LEN]
@@ -112,6 +157,35 @@ def _sanitize_subject(subject: str, nsfw_enabled: bool) -> str:
         # strip explicit asks, force modest framing when SFW
         return "covered, modest pose, cozy casual outfit"
     return s
+
+
+def _strip_subject_prefixes(clean_subject: str) -> str:
+    """Repeatedly strip leading chat filler: 'send me a pic of you nude' -> 'nude'.
+
+    Prefixes only match on word boundaries so 'a pic of you' does not match
+    inside 'a pic of your feet'.
+    """
+    while True:
+        low = clean_subject.lower()
+        stripped = False
+        for prefix in _SUBJECT_PREFIXES:
+            if low.startswith(prefix):
+                rest = clean_subject[len(prefix):]
+                # word-boundary guard: "you" must not be followed by a letter ("your")
+                if rest and rest[0].isalpha():
+                    continue
+                clean_subject = rest.strip(" ,.-:")
+                stripped = True
+                break
+        if not stripped:
+            break
+    # trailing politeness adds nothing for the diffusion model
+    low = clean_subject.lower()
+    if low.endswith("please"):
+        tail = clean_subject[:-len("please")].strip(" ,.-:")
+        if tail:
+            clean_subject = tail
+    return clean_subject
 
 
 def negative_prompt(cfg: Config, persona: dict) -> str:
@@ -127,18 +201,26 @@ def image_prompt(cfg: Config, persona: dict, subject: Optional[str] = None) -> s
     tags = list(persona.get("image_quality_tags", []))
     if cfg.nsfw:
         tags += list(persona.get("image_nsfw_tags", []))
-    parts = [f"portrait photo of {name}, {appearance}"]
     clean_subject = _sanitize_subject(subject or "", cfg.nsfw)
     # avoid echoing raw chat ("send me a photo of you in paris" -> "in paris")
+    nsfw_extras: list[str] = []
     if clean_subject:
-        low = clean_subject.lower()
-        for prefix in ("send me", "give me", "gimme", "show me", "please send", "a photo of you", "a pic of you"):
-            if low.startswith(prefix):
-                clean_subject = clean_subject[len(prefix):].strip(" ,.-:")
-                low = clean_subject.lower()
-                break
-        if clean_subject:
-            parts.append(clean_subject)
+        clean_subject = _strip_subject_prefixes(clean_subject)
+        if cfg.nsfw and clean_subject:
+            low = clean_subject.lower()
+            nsfw_extras = _nsfw_extra_tags(low)
+            if any(w in low for w in _CLOTHING_CONFLICT_WORDS):
+                # drop the default "hoodie and shorts" sentence so clothed-vs-nude
+                # tokens don't cancel each other out in the diffusion model.
+                appearance = appearance.split("She dresses")[0].strip()
+    # body-part subjects need the whole body in frame — a portrait crop hides feet.
+    shot = "full-body photo" if any("full-body" in e for e in nsfw_extras) else "portrait photo"
+    if clean_subject:
+        parts = [f"{shot} of {name}, {appearance}", clean_subject]
+    else:
+        parts = [f"{shot} of {name}, {appearance}"]
+    if nsfw_extras:
+        parts.append(", ".join(nsfw_extras))
     if not cfg.nsfw:
         parts.append("covered, modest pose")
     parts.append(", ".join(tags))

@@ -349,6 +349,7 @@ class GirlfriendService:
         visual = await self._rewrite_subject(subject)
         prompt = persona_mod.image_prompt(self.cfg, self.persona, visual)
         negative = persona_mod.negative_prompt(self.cfg, self.persona)
+        log.info("image prompt (subject=%r): %s", visual, prompt[:500])
         seed = random.randint(0, 2**31 - 1)
         return await self.comfy.generate(graph, positive=prompt, negative=negative, seed=seed)
 
@@ -359,6 +360,7 @@ class GirlfriendService:
         visual = await self._rewrite_subject(subject)
         prompt = persona_mod.image_prompt(self.cfg, self.persona, visual)
         negative = persona_mod.negative_prompt(self.cfg, self.persona)
+        log.info("video prompt (subject=%r): %s", visual, prompt[:500])
         seed = random.randint(0, 2**31 - 1)
         return await self.comfy.generate(graph, positive=prompt, negative=negative, seed=seed)
 
