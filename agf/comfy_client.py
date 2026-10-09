@@ -75,12 +75,78 @@ class ComfyClient:
             )
         return raw
 
+    # Any text-encoder node counts as a prompt node (SD1.5 + SDXL + SD3 + Flux variants).
+    _PROMPT_TYPES = (
+        "CLIPTextEncode",
+        "CLIPTextEncodeFlux",
+        "CLIPTextEncodeSD3",
+        "CLIPTextEncodeSDXL",
+        "CLIPTextEncodeHunyuanDiT",
+    )
+
+    # Loader inputs that select the main diffusion weights.
+    _MODEL_INPUTS = ("ckpt_name", "unet_name", "model_name")
+
+    @staticmethod
+    def _is_prompt_node(node: dict) -> bool:
+        class_type = str(node.get("class_type", ""))
+        return class_type == "CLIPTextEncode" or class_type.startswith("CLIPTextEncode")
+
+    @staticmethod
+    def _set_prompt_text(inputs: dict, text: str, force: bool = False) -> bool:
+        """Set prompt text on a node regardless of its schema. Returns True if set.
+
+        With force=True, a linked text input (e.g. from a StringConcatenate /
+        prompt-enhancement chain) is replaced with the literal string, cutting
+        the upstream chain off the output path so it no longer executes.
+        """
+        updated = False
+        # Flux-style encoders use clip_l / t5xxl instead of text.
+        for key in ("text", "clip_l", "t5xxl", "prompt"):
+            if key not in inputs:
+                continue
+            if isinstance(inputs.get(key), str) or force:
+                inputs[key] = text
+                updated = True
+        return updated
+
+    @staticmethod
+    def _prune_disconnected(graph: dict) -> dict:
+        """Drop nodes that cannot reach a Save* output node.
+
+        Removes prompt-enhancement chains, preview nodes and selector widgets
+        left disconnected after prompt override. Never raises; returns the
+        graph unchanged when no Save* node exists.
+        """
+        keymap = {str(node_id): node_id for node_id in graph}
+        save_ids = [
+            node_id
+            for node_id, node in graph.items()
+            if isinstance(node, dict) and str(node.get("class_type", "")).startswith("Save")
+        ]
+        if not save_ids:
+            return graph
+        keep: set = set(save_ids)
+        stack = list(save_ids)
+        while stack:
+            node = graph.get(stack.pop())
+            inputs = node.get("inputs") if isinstance(node, dict) else None
+            if not isinstance(inputs, dict):
+                continue
+            for value in inputs.values():
+                if isinstance(value, list) and len(value) == 2:
+                    ref = keymap.get(str(value[0]))
+                    if ref is not None and ref not in keep:
+                        keep.add(ref)
+                        stack.append(ref)
+        return {node_id: node for node_id, node in graph.items() if node_id in keep}
+
     @staticmethod
     def _positive_node_ids(graph: dict) -> list[str]:
         encoders = [
             node_id
             for node_id, node in graph.items()
-            if isinstance(node, dict) and node.get("class_type") == "CLIPTextEncode"
+            if isinstance(node, dict) and ComfyClient._is_prompt_node(node)
         ]
         for node_id, node in graph.items():
             if not isinstance(node, dict):
@@ -107,7 +173,7 @@ class ComfyClient:
         encoders = [
             node_id
             for node_id, node in graph.items()
-            if isinstance(node, dict) and node.get("class_type") == "CLIPTextEncode"
+            if isinstance(node, dict) and ComfyClient._is_prompt_node(node)
         ]
         positive_ids = set(ComfyClient._positive_node_ids(graph))
         negatives: list[str] = []
@@ -143,15 +209,25 @@ class ComfyClient:
             inputs = node["inputs"]
             class_type = node.get("class_type", "")
             if positive is not None and node_id in target_ids:
-                inputs["text"] = positive
+                # force=True: replace linked enhancement-chain inputs with the
+                # literal prompt so the bot's text is what actually generates.
+                ComfyClient._set_prompt_text(inputs, positive, force=True)
             if negative is not None and node_id in neg_ids:
-                inputs["text"] = negative
+                ComfyClient._set_prompt_text(inputs, negative, force=True)
             if seed is not None and "seed" in inputs:
                 # Distinct seed per sampler node: same run, uncorrelated noise.
                 inputs["seed"] = int(seed) + seed_counter
                 seed_counter += 1
-            if checkpoint is not None and class_type == "CheckpointLoaderSimple":
-                inputs["ckpt_name"] = checkpoint
+            if checkpoint is not None:
+                # Checkpoint override works for legacy (ckpt_name) and
+                # modern (UNETLoader / FluxLoader model_name) workflows.
+                for key in ComfyClient._MODEL_INPUTS:
+                    if key in inputs and isinstance(inputs.get(key), str):
+                        inputs[key] = checkpoint
+                        break
+        # Cut enhancement chains / preview branches left disconnected by the
+        # prompt override so they neither validate nor execute.
+        prepared = ComfyClient._prune_disconnected(prepared)
         return prepared
 
     @staticmethod
@@ -163,7 +239,7 @@ class ComfyClient:
             return [str(exc)]
         problems: list[str] = []
         if not ComfyClient._positive_node_ids(graph):
-            problems.append("no CLIPTextEncode positive node found")
+            problems.append("no CLIPTextEncode* positive node found")
         if not ComfyClient._negative_node_ids(graph):
             problems.append("no negative prompt node found (continuing with positive only)")
         has_sampler = any(
@@ -174,11 +250,107 @@ class ComfyClient:
             problems.append("no sampler/seed node found — seeds will not be randomized")
         return problems
 
+    @staticmethod
+    def required_models(graph: dict) -> list[tuple[str, str, str, str]]:
+        """List (node_id, class_type, input_name, value) model references in a workflow."""
+        refs: list[tuple[str, str, str, str]] = []
+        for node_id, node in graph.items():
+            if not isinstance(node, dict) or not isinstance(node.get("inputs"), dict):
+                continue
+            class_type = str(node.get("class_type", ""))
+            for key in (
+                "ckpt_name",
+                "unet_name",
+                "model_name",
+                "clip_name",
+                "clip_name1",
+                "clip_name2",
+                "clip_name2_opt",
+                "vae_name",
+                "lora_name",
+            ):
+                value = node["inputs"].get(key)
+                if isinstance(value, str) and value and not value.startswith("."):
+                    refs.append((str(node_id), class_type, key, value))
+        return refs
+
+    async def server_models(self) -> dict[str, list[str]]:
+        """Best-effort fetch of installed models per folder. Never raises."""
+        out: dict[str, list[str]] = {}
+        for folder in ("checkpoints", "diffusion_models", "vae", "loras", "text_encoders"):
+            try:
+                response = await self._http.get(f"/models/{folder}", timeout=10.0)
+                if response.status_code == 200:
+                    data = response.json()
+                    if isinstance(data, list):
+                        out[folder] = [str(x) for x in data]
+            except (httpx.HTTPError, ValueError):
+                continue
+        return out
+
+    async def validate_against_server(self, graph: dict) -> list[str]:
+        """Compare workflow model names to what ComfyUI actually has installed."""
+        problems: list[str] = []
+        try:
+            available = await self.server_models()
+        except Exception:
+            return []
+        if not available:
+            return []
+        pools = {
+            "ckpt_name": available.get("checkpoints", []),
+            "unet_name": available.get("diffusion_models", []),
+            "model_name": available.get("diffusion_models", [])
+            + available.get("checkpoints", []),
+            "clip_name": available.get("text_encoders", []),
+            "clip_name1": available.get("text_encoders", []),
+            "clip_name2": available.get("text_encoders", []),
+            "clip_name2_opt": available.get("text_encoders", []),
+            "vae_name": available.get("vae", []),
+            "lora_name": available.get("loras", []),
+        }
+        for node_id, class_type, key, value in self.required_models(graph):
+            pool = pools.get(key, [])
+            # Empty pool + non-empty request = nothing of that kind installed.
+            if value not in pool:
+                problems.append(
+                    f"node {node_id} ({class_type}) asks for {key}={value!r} "
+                    f"but the server has [{', '.join(pool) or 'nothing installed'}] "
+                    f"— update the workflow or install the missing model"
+                )
+        return problems
+
+    @staticmethod
+    def _explain_prompt_error(body: str) -> str:
+        """Turn ComfyUI's validation JSON into a one-line actionable hint."""
+        try:
+            data = json.loads(body)
+        except ValueError:
+            return body[:2000]
+        node_errors = data.get("node_errors") if isinstance(data, dict) else None
+        if not isinstance(node_errors, dict) or not node_errors:
+            return body[:2000]
+        hints: list[str] = []
+        for node_id, info in node_errors.items():
+            for err in (info.get("errors") if isinstance(info, dict) else []) or []:
+                if not isinstance(err, dict):
+                    continue
+                if err.get("type") == "value_not_in_list":
+                    hints.append(
+                        f"node {node_id}: {err.get('message')} "
+                        f"(input {err.get('extra_info', {}).get('input_name')}) — "
+                        "the model file in your workflow is not installed on the ComfyUI server"
+                    )
+                else:
+                    hints.append(f"node {node_id}: {err.get('message', err)}")
+        return "; ".join(hints)[:2000] if hints else body[:2000]
+
     async def queue(self, graph: dict, client_id: str | None = None) -> str:
         payload = {"prompt": graph, "client_id": client_id or str(uuid.uuid4())}
         response = await self._http.post("/prompt", json=payload)
         if response.status_code != 200:
-            raise ComfyError(f"comfy prompt failed ({response.status_code}): {response.text[:400]}")
+            hint = self._explain_prompt_error(response.text)
+            raise ComfyError(f"comfy prompt failed ({response.status_code}): {hint}")
         return response.json()["prompt_id"]
 
     async def wait(self, prompt_id: str, timeout: float = 600.0) -> list[MediaRef]:

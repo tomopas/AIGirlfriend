@@ -56,3 +56,29 @@ def test_prepare_negative_prompt() -> None:
     prepared = ComfyClient.prepare(GRAPH, positive="pos", negative="neg words")
     assert prepared["6"]["inputs"]["text"] == "pos"
     assert prepared["7"]["inputs"]["text"] == "neg words"
+
+
+def test_prepare_overrides_linked_prompt_text() -> None:
+    """A prompt node fed by an enhancement chain gets the literal prompt."""
+    graph = {
+        "1": {"class_type": "CLIPTextEncode", "inputs": {"text": ["2", 0], "clip": ["0", 1]}},
+        "2": {"class_type": "StringConcatenate", "inputs": {"string_a": ["3", 0]}},
+        "3": {"class_type": "PrimitiveStringMultiline", "inputs": {"value": "stale default"}},
+        "4": {"class_type": "PreviewAny", "inputs": {"source": ["2", 0]}},
+        "5": {
+            "class_type": "KSampler",
+            "inputs": {"seed": 1, "positive": ["1", 0], "negative": ["1", 0]},
+        },
+        "8": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0]}},
+        "9": {"class_type": "SaveImage", "inputs": {"images": ["8", 0]}},
+    }
+    prepared = ComfyClient.prepare(graph, positive="fresh persona prompt", seed=9)
+    assert prepared["1"]["inputs"]["text"] == "fresh persona prompt"
+    # Enhancement chain + preview pruned; output chain kept.
+    assert set(prepared) == {"1", "5", "8", "9"}
+    assert prepared["5"]["inputs"]["seed"] == 9
+
+
+def test_prepare_without_save_node_keeps_everything() -> None:
+    prepared = ComfyClient.prepare(GRAPH, positive="x", seed=1)
+    assert set(prepared) == set(GRAPH)

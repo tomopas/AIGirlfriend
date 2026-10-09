@@ -58,10 +58,17 @@ async def check(cfg: Config) -> int:
             problems = ComfyClient.validate_workflow(path)
             try:
                 graph = ComfyClient.load_graph(path)
+                try:
+                    server_problems = await comfy.validate_against_server(graph)
+                except Exception:
+                    server_problems = []
+                problems = problems + server_problems
                 if not problems:
                     print(f"{label} workflow {path}: OK ({len(graph)} nodes)")
                 else:
                     print(f"{label} workflow {path}: OK with warnings: {'; '.join(problems)}")
+                    if any("asks for" in p for p in server_problems):
+                        ok = False
             except Exception as exc:
                 ok = False
                 print(f"{label} workflow {path}: FAIL — {exc}")
